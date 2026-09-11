@@ -1,5 +1,54 @@
 # @supabase/ssr
 
+## [0.12.7](https://github.com/supabase/ssr/compare/v0.12.6...v0.12.7) (2026-09-08)
+
+
+### Bug Fixes
+
+* apply non-browser defaults when cookies only sets encode ([#294](https://github.com/supabase/ssr/issues/294)) ([9d6e2a5](https://github.com/supabase/ssr/commit/9d6e2a54f5e7f205388218f7fe732b8622d3ebd8))
+
+## [0.12.6](https://github.com/supabase/ssr/compare/v0.12.5...v0.12.6) (2026-09-04)
+
+
+### Bug Fixes
+
+* avoid duplicate cache headers per server client ([#283](https://github.com/supabase/ssr/issues/283)) ([af750e2](https://github.com/supabase/ssr/commit/af750e259b7fab43b9cbc0c19873384a666a7a47))
+
+## [0.12.5](https://github.com/supabase/ssr/compare/v0.12.4...v0.12.5) (2026-08-24)
+
+
+### Bug Fixes
+
+* warn when auth.storage is ignored by createBrowserClient/createServerClient ([#284](https://github.com/supabase/ssr/issues/284)) ([c1700f2](https://github.com/supabase/ssr/commit/c1700f277f7f03b13e20ff11abeea633816d5238)), closes [#142](https://github.com/supabase/ssr/issues/142)
+
+## [0.12.4](https://github.com/supabase/ssr/compare/v0.12.3...v0.12.4) (2026-07-28)
+
+
+### Bug Fixes
+
+* flush PKCE verifier slot removals on the server ([#275](https://github.com/supabase/ssr/issues/275)) ([6df6f03](https://github.com/supabase/ssr/commit/6df6f031d798c95412ae7251337938408f57553c))
+
+## [0.12.3](https://github.com/supabase/ssr/compare/v0.12.2...v0.12.3) (2026-07-14)
+
+
+### Bug Fixes
+
+* **cookies:** keep domain-scoped deletion in name-keyed cookie stores ([#258](https://github.com/supabase/ssr/issues/258)) ([d3a8a98](https://github.com/supabase/ssr/commit/d3a8a982b496a68e039a99fb64ebc6bc31f91fb9)), closes [#256](https://github.com/supabase/ssr/issues/256)
+
+## [0.12.2](https://github.com/supabase/ssr/compare/v0.12.1...v0.12.2) (2026-07-14)
+
+
+### Bug Fixes
+
+* align parseCookieHeader return type with getAll cookie method ([#239](https://github.com/supabase/ssr/issues/239)) ([e8fe1d5](https://github.com/supabase/ssr/commit/e8fe1d51a99b2e27d51f7aa1fb0fb7efac7f6581)), closes [#115](https://github.com/supabase/ssr/issues/115)
+
+## [0.12.1](https://github.com/supabase/ssr/compare/v0.12.0...v0.12.1) (2026-07-13)
+
+
+### Bug Fixes
+
+* **cookies:** deduplicate server cookie writes ([#246](https://github.com/supabase/ssr/issues/246)) ([035eabe](https://github.com/supabase/ssr/commit/035eabe77385f36fbd744b50e08db2e21df0400b))
+
 ## [0.12.0](https://github.com/supabase/ssr/compare/v0.11.0...v0.12.0) (2026-06-09)
 
 

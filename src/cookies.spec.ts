@@ -8,7 +8,12 @@ import {
 } from "./utils";
 import { CookieOptions } from "./types";
 
-import { createStorageFromOptions, applyServerStorage } from "./cookies";
+import {
+  createStorageFromOptions,
+  applyServerStorage,
+  isPkceFlowIndexKey,
+  isPkceVerifierSlotKey,
+} from "./cookies";
 
 describe("createStorageFromOptions in browser without cookie methods", () => {
   beforeEach(() => {
@@ -252,6 +257,58 @@ describe("createStorageFromOptions for createServerClient", () => {
   });
 
   describe("storage with getAll, setAll", () => {
+    type SetAllCall = {
+      cookies: { name: string; value: string; options: CookieOptions }[];
+      headers: Record<string, string>;
+    };
+
+    const createServerStorageWithSetAll = (
+      setAll: (
+        setCookies: SetAllCall["cookies"],
+        headers: SetAllCall["headers"],
+      ) => Promise<void> | void,
+      getAll: () => Promise<{ name: string; value: string }[]> = async () => [],
+    ) =>
+      createStorageFromOptions(
+        {
+          cookieEncoding: "raw", // to help test readability
+          cookies: {
+            getAll,
+            setAll,
+          },
+        },
+        true,
+      );
+
+    it("should retry cache headers when setAll rejects", async () => {
+      const cacheHeaders = {
+        "Cache-Control": "no-store",
+        Expires: "0",
+        Pragma: "no-cache",
+      };
+      const cookiesToSet = [{ name: "cookie", value: "value", options: {} }];
+      const receivedHeaders: Record<string, string>[] = [];
+      let setAllCalls = 0;
+
+      const { setAll } = createServerStorageWithSetAll(
+        async (_setCookies, headers) => {
+          setAllCalls += 1;
+          receivedHeaders.push(headers);
+
+          if (setAllCalls === 1) {
+            throw new Error("setAll failed");
+          }
+        },
+      );
+
+      await expect(setAll(cookiesToSet, cacheHeaders)).rejects.toThrow(
+        "setAll failed",
+      );
+      await expect(setAll(cookiesToSet, cacheHeaders)).resolves.toBeUndefined();
+
+      expect(receivedHeaders).toEqual([cacheHeaders, cacheHeaders]);
+    });
+
     it("should not call setAll on setItem", async () => {
       let setAllCalled = false;
 
@@ -302,6 +359,172 @@ describe("createStorageFromOptions for createServerClient", () => {
       expect(setAllCalled).toBeFalsy();
       expect(setItems).toEqual({});
       expect(removedItems).toEqual({ "storage-key": true });
+    });
+
+    describe("PKCE code verifier keys", () => {
+      // auth-js has no `onAuthStateChange` event to announce a verifier write,
+      // so the storage is applied immediately for the verifier key family.
+      const STORAGE_KEY = "sb-project-ref-auth-token";
+      const LEGACY_KEY = `${STORAGE_KEY}-code-verifier`;
+      const INDEX_KEY = `${STORAGE_KEY}-flows-code-verifier`;
+      const slotKey = (flowId: string) =>
+        `${STORAGE_KEY}-flow-${flowId}-code-verifier`;
+      // shaped like a real flow id: 32 hex characters
+      const FLOW_ID = "0123456789abcdef0123456789abcdef";
+
+      const removedCookieOptions = { ...DEFAULT_COOKIE_OPTIONS, maxAge: 0 };
+
+      const recordInto =
+        (calls: SetAllCall[]) =>
+        async (
+          cookies: SetAllCall["cookies"],
+          headers: SetAllCall["headers"],
+        ) => {
+          calls.push({ cookies, headers });
+        };
+
+      it("recognizes only per-flow slot keys as verifier slots", () => {
+        const slots = [slotKey(FLOW_ID), slotKey("flow-id-with-dashes")];
+        const notSlots = [
+          // the fixed key and the flow index are not slots
+          LEGACY_KEY,
+          INDEX_KEY,
+          STORAGE_KEY,
+          // too short to be a flow id, so a storage key that happens to
+          // contain `-flow-` does not look like a slot
+          "my-flow-abc-code-verifier",
+        ];
+
+        expect(slots.filter(isPkceVerifierSlotKey)).toEqual(slots);
+        expect(notSlots.filter(isPkceVerifierSlotKey)).toEqual([]);
+
+        // the index is matched separately, and only the index
+        expect(isPkceFlowIndexKey(INDEX_KEY)).toBe(true);
+        expect(slots.filter(isPkceFlowIndexKey)).toEqual([]);
+        expect(isPkceFlowIndexKey(LEGACY_KEY)).toBe(false);
+      });
+
+      it("should call setAll on setItem for the fixed code verifier key", async () => {
+        const setAllCalls: SetAllCall[] = [];
+        const { storage, setItems } = createServerStorageWithSetAll(
+          recordInto(setAllCalls),
+        );
+
+        await storage.setItem(LEGACY_KEY, "verifier-value");
+
+        expect(setAllCalls).toHaveLength(1);
+        expect(setAllCalls[0].cookies).toEqual([
+          {
+            name: LEGACY_KEY,
+            value: "verifier-value",
+            options: { ...DEFAULT_COOKIE_OPTIONS },
+          },
+        ]);
+        // the buffer is still updated so a later applyServerStorage agrees
+        expect(setItems).toEqual({ [LEGACY_KEY]: "verifier-value" });
+      });
+
+      it("should call setAll on removeItem for a verifier slot key", async () => {
+        const setAllCalls: SetAllCall[] = [];
+        const { storage, setItems, removedItems } =
+          createServerStorageWithSetAll(recordInto(setAllCalls), async () => [
+            { name: slotKey(FLOW_ID), value: "verifier-value" },
+          ]);
+
+        await storage.removeItem(slotKey(FLOW_ID));
+
+        expect(setAllCalls).toHaveLength(1);
+        expect(setAllCalls[0].cookies).toEqual([
+          {
+            name: slotKey(FLOW_ID),
+            value: "",
+            options: removedCookieOptions,
+          },
+        ]);
+        expect(setItems).toEqual({});
+        expect(removedItems).toEqual({ [slotKey(FLOW_ID)]: true });
+      });
+
+      it("should not call setAll on removeItem for the fixed code verifier key", async () => {
+        const setAllCalls: SetAllCall[] = [];
+        const { storage, removedItems } = createServerStorageWithSetAll(
+          recordInto(setAllCalls),
+          async () => [{ name: LEGACY_KEY, value: "verifier-value" }],
+        );
+
+        await storage.removeItem(LEGACY_KEY);
+
+        // stays buffered: the exchange that removes it is followed by an auth
+        // event which applies the storage
+        expect(setAllCalls).toEqual([]);
+        expect(removedItems).toEqual({ [LEGACY_KEY]: true });
+      });
+
+      it("should call setAll on removeItem for the flow index key", async () => {
+        // the index is dropped when the last pending flow goes away, which
+        // happens from a catch block on a failed flow with no auth event to
+        // apply the storage. Leaving it buffered would keep an index in the
+        // browser naming a slot that was already cleared.
+        const setAllCalls: SetAllCall[] = [];
+        const { storage, removedItems } = createServerStorageWithSetAll(
+          recordInto(setAllCalls),
+          async () => [{ name: INDEX_KEY, value: "[]" }],
+        );
+
+        await storage.removeItem(INDEX_KEY);
+
+        expect(setAllCalls).toHaveLength(1);
+        expect(setAllCalls[0].cookies).toEqual([
+          { name: INDEX_KEY, value: "", options: removedCookieOptions },
+        ]);
+        expect(removedItems).toEqual({ [INDEX_KEY]: true });
+      });
+
+      it("clears the evicted slot cookie when a flow start overflows the ring", async () => {
+        // auth-js bounds concurrent flows at 5. Starting a 6th evicts the
+        // oldest slot and rewrites the index without it. The index write is
+        // applied, so if the eviction were only buffered -- no auth event
+        // fires on a flow *start* -- the evicted cookie would survive with
+        // nothing left referencing it.
+        const flowIds = [1, 2, 3, 4, 5, 6].map((n) => `${n}`.repeat(32));
+        const cookieStore: Record<string, string> = {
+          [LEGACY_KEY]: "verifier-5",
+          [INDEX_KEY]: JSON.stringify(flowIds.slice(0, 5)),
+        };
+        flowIds.slice(0, 5).forEach((flowId, i) => {
+          cookieStore[slotKey(flowId)] = `verifier-${i + 1}`;
+        });
+
+        const { storage } = createServerStorageWithSetAll(
+          async (setCookies) => {
+            setCookies.forEach(({ name, value }) => {
+              if (value) {
+                cookieStore[name] = value;
+              } else {
+                delete cookieStore[name];
+              }
+            });
+          },
+          async () =>
+            Object.entries(cookieStore).map(([name, value]) => ({
+              name,
+              value,
+            })),
+        );
+
+        // the writes auth-js performs when starting the 6th flow
+        await storage.setItem(slotKey(flowIds[5]), "verifier-6");
+        await storage.removeItem(slotKey(flowIds[0]));
+        await storage.setItem(INDEX_KEY, JSON.stringify(flowIds.slice(1)));
+        await storage.setItem(LEGACY_KEY, "verifier-6");
+
+        expect(Object.keys(cookieStore).filter(isPkceVerifierSlotKey)).toEqual(
+          flowIds.slice(1).map(slotKey),
+        );
+        // the evicted slot is gone rather than orphaned
+        expect(cookieStore[slotKey(flowIds[0])]).toBeUndefined();
+        expect(cookieStore[slotKey(flowIds[5])]).toBe("verifier-6");
+      });
     });
 
     it("should not call getAll if item has already been set", async () => {
@@ -464,6 +687,117 @@ describe("createStorageFromOptions for createServerClient", () => {
       const value = await storage.getItem("storage-key");
 
       expect(value).toEqual("value");
+    });
+
+    it("skips no-op server setAll batches across distinct setAll closures when getAll reflects previous writes", async () => {
+      const cookieStore: Record<string, string> = {};
+      const setAllCalls: SetAllCall[] = [];
+      const createStorage = () =>
+        createServerStorageWithSetAll(
+          async (setCookies, headers) => {
+            setAllCalls.push({ cookies: setCookies, headers });
+
+            setCookies.forEach(({ name, value }) => {
+              if (value) {
+                cookieStore[name] = value;
+              } else {
+                delete cookieStore[name];
+              }
+            });
+          },
+          async () =>
+            Object.entries(cookieStore).map(([name, value]) => ({
+              name,
+              value,
+            })),
+        );
+
+      const first = createStorage();
+      const second = createStorage();
+
+      expect(first.setAll).not.toBe(second.setAll);
+
+      await first.storage.setItem("storage-key", "value");
+      await second.storage.setItem("storage-key", "value");
+
+      await applyServerStorage(first, {
+        cookieEncoding: "raw", // to help test readability
+      });
+      await applyServerStorage(second, {
+        cookieEncoding: "raw", // to help test readability
+      });
+
+      expect(setAllCalls).toEqual([
+        {
+          cookies: [
+            {
+              name: "storage-key",
+              value: "value",
+              options: { ...DEFAULT_COOKIE_OPTIONS },
+            },
+          ],
+          headers: {
+            "Cache-Control":
+              "private, no-cache, no-store, must-revalidate, max-age=0",
+            Expires: "0",
+            Pragma: "no-cache",
+          },
+        },
+      ]);
+    });
+
+    it("writes server setAll batches when the reflected payload differs", async () => {
+      const cookieStore: Record<string, string> = {};
+      const setAllCalls: SetAllCall[] = [];
+      const createStorage = () =>
+        createServerStorageWithSetAll(
+          async (setCookies, headers) => {
+            setAllCalls.push({ cookies: setCookies, headers });
+
+            setCookies.forEach(({ name, value }) => {
+              if (value) {
+                cookieStore[name] = value;
+              } else {
+                delete cookieStore[name];
+              }
+            });
+          },
+          async () =>
+            Object.entries(cookieStore).map(([name, value]) => ({
+              name,
+              value,
+            })),
+        );
+
+      const first = createStorage();
+      const second = createStorage();
+
+      await first.storage.setItem("storage-key", "value");
+      await second.storage.setItem("storage-key", "new-value");
+
+      await applyServerStorage(first, {
+        cookieEncoding: "raw", // to help test readability
+      });
+      await applyServerStorage(second, {
+        cookieEncoding: "raw", // to help test readability
+      });
+
+      expect(setAllCalls.map(({ cookies }) => cookies)).toEqual([
+        [
+          {
+            name: "storage-key",
+            value: "value",
+            options: { ...DEFAULT_COOKIE_OPTIONS },
+          },
+        ],
+        [
+          {
+            name: "storage-key",
+            value: "new-value",
+            options: { ...DEFAULT_COOKIE_OPTIONS },
+          },
+        ],
+      ]);
     });
   });
 
@@ -1294,7 +1628,7 @@ describe("host-only also-clear when cookieOptions.domain is set", () => {
       ]);
     });
 
-    it("emits two Set-Cookies per chunk when domain is configured (with-domain + host-only)", async () => {
+    it("emits two Set-Cookies per chunk when domain is configured (host-only + with-domain)", async () => {
       const setAllCalls: {
         name: string;
         value: string;
@@ -1328,10 +1662,10 @@ describe("host-only also-clear when cookieOptions.domain is set", () => {
       const hostOnly = { ...DEFAULT_COOKIE_OPTIONS, maxAge: 0 };
 
       expect(setAllCalls).toEqual([
-        { name: "storage-key", value: "", options: withDomain },
-        { name: "storage-key.0", value: "", options: withDomain },
         { name: "storage-key", value: "", options: hostOnly },
         { name: "storage-key.0", value: "", options: hostOnly },
+        { name: "storage-key", value: "", options: withDomain },
+        { name: "storage-key.0", value: "", options: withDomain },
       ]);
     });
 
@@ -1355,6 +1689,82 @@ describe("host-only also-clear when cookieOptions.domain is set", () => {
       await storage.removeItem("storage-key");
 
       expect(setAllCalls).toEqual([]);
+    });
+  });
+
+  describe("name-keyed cookie store (Next.js ResponseCookies semantics)", () => {
+    // Next.js backs cookies() / NextResponse.cookies with a store keyed by
+    // cookie name only, so a later set() for the same name overwrites the
+    // earlier one when it rewrites the Set-Cookie headers. When a domain is
+    // configured, the best-effort host-only clear must not displace the
+    // domain-scoped deletion that actually matches the cookies this library
+    // set, otherwise the session cookie is never removed on signOut (#256).
+    it("keeps the domain-scoped deletion after a same-name host-only clear", async () => {
+      const store = new Map<string, CookieOptions>();
+
+      const { storage } = createStorageFromOptions(
+        {
+          cookieEncoding: "raw",
+          cookieOptions: { domain: ".example.com" },
+          cookies: {
+            getAll: async () => [
+              { name: "storage-key", value: "value" },
+              { name: "storage-key.0", value: "chunk-0" },
+            ],
+            setAll: async (setCookies) => {
+              // model @edge-runtime/cookies: last write for a name wins
+              setCookies.forEach(({ name, options }) =>
+                store.set(name, options),
+              );
+            },
+          },
+        },
+        false,
+      );
+
+      await storage.removeItem("storage-key");
+
+      expect(store.get("storage-key")?.domain).toBe(".example.com");
+      expect(store.get("storage-key.0")?.domain).toBe(".example.com");
+    });
+
+    it("keeps the domain-scoped deletion through applyServerStorage", async () => {
+      // same store semantics as above, but through the server path that
+      // powers signOut() in Next.js Route Handlers and Server Actions
+      const store = new Map<string, CookieOptions>();
+
+      const { storage, getAll, setAll, setItems, removedItems } =
+        createStorageFromOptions(
+          {
+            cookieEncoding: "raw",
+            cookieOptions: { domain: ".example.com" },
+            cookies: {
+              getAll: async () => [
+                { name: "remove-key", value: "value" },
+                { name: "remove-key.0", value: "chunk-0" },
+              ],
+              setAll: async (setCookies) => {
+                // model @edge-runtime/cookies: last write for a name wins
+                setCookies.forEach(({ name, options }) =>
+                  store.set(name, options),
+                );
+              },
+            },
+          },
+          true,
+        );
+
+      await storage.removeItem("remove-key");
+      await applyServerStorage(
+        { getAll, setAll, setItems, removedItems },
+        {
+          cookieEncoding: "raw",
+          cookieOptions: { domain: ".example.com" },
+        },
+      );
+
+      expect(store.get("remove-key")?.domain).toBe(".example.com");
+      expect(store.get("remove-key.0")?.domain).toBe(".example.com");
     });
   });
 
@@ -1396,10 +1806,10 @@ describe("host-only also-clear when cookieOptions.domain is set", () => {
         domain: ".example.com",
       };
 
-      // Order: with-domain removes, then host-only removes, then the set.
+      // Order: host-only removes, then with-domain removes, then the set.
       expect(setAllCalls).toEqual([
-        { name: "storage-key.4", value: "", options: withDomainRemove },
         { name: "storage-key.4", value: "", options: hostOnlyRemove },
+        { name: "storage-key.4", value: "", options: withDomainRemove },
         { name: "storage-key", value: "new-value", options: withDomainSet },
       ]);
     });
@@ -1448,10 +1858,10 @@ describe("host-only also-clear when cookieOptions.domain is set", () => {
       const hostOnly = { ...DEFAULT_COOKIE_OPTIONS, maxAge: 0 };
 
       expect(setAllCalls).toEqual([
-        { name: "remove-key", value: "", options: withDomain },
-        { name: "remove-key.0", value: "", options: withDomain },
         { name: "remove-key", value: "", options: hostOnly },
         { name: "remove-key.0", value: "", options: hostOnly },
+        { name: "remove-key", value: "", options: withDomain },
+        { name: "remove-key.0", value: "", options: withDomain },
       ]);
     });
 

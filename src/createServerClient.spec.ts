@@ -1,8 +1,9 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 import { MAX_CHUNK_SIZE, stringToBase64URL } from "./utils";
 import { CookieOptions } from "./types";
 import { createServerClient } from "./createServerClient";
+import { resetWarnOnceForTesting } from "./warnOnce";
 
 describe("createServerClient", () => {
   describe("validation", () => {
@@ -39,6 +40,67 @@ describe("createServerClient", () => {
 
   describe("use cases", () => {
     const storageKeys = [null, "custom-storage-key"];
+
+    it("should not repeat cache headers across PKCE cookie writes", async () => {
+      const cookieStore = new Map<string, string>();
+      const responseHeaders = new Map<string, string>();
+      let setAllCalls = 0;
+
+      const supabase = createServerClient(
+        "https://project-ref.supabase.co",
+        "anon-key",
+        {
+          cookies: {
+            getAll() {
+              return [...cookieStore].map(([name, value]) => ({ name, value }));
+            },
+
+            setAll(cookiesToSet, headers) {
+              setAllCalls += 1;
+
+              cookiesToSet.forEach(({ name, value }) => {
+                if (value) {
+                  cookieStore.set(name, value);
+                } else {
+                  cookieStore.delete(name);
+                }
+              });
+
+              Object.entries(headers).forEach(([name, value]) => {
+                const normalizedName = name.toLowerCase();
+
+                if (responseHeaders.has(normalizedName)) {
+                  throw new Error(`"${name}" header is already set`);
+                }
+
+                responseHeaders.set(normalizedName, value);
+              });
+            },
+          },
+
+          global: {
+            fetch: async () =>
+              new Response("{}", {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              }),
+          },
+        },
+      );
+
+      const { error } = await supabase.auth.signInWithOtp({
+        email: "user@example.com",
+      });
+
+      expect(error).toBeNull();
+      expect(setAllCalls).toEqual(3);
+      expect(Object.fromEntries(responseHeaders)).toEqual({
+        "cache-control":
+          "private, no-cache, no-store, must-revalidate, max-age=0",
+        expires: "0",
+        pragma: "no-cache",
+      });
+    });
 
     storageKeys.forEach((storageKey) => {
       it(`should set PKCE code verifier correctly (storage key = ${storageKey})`, async () => {
@@ -86,13 +148,21 @@ describe("createServerClient", () => {
         });
 
         expect(error).toBeNull();
-        expect(setAllCalls).toEqual(1);
+        // since supabase-js 2.111.0 a flow start writes three keys (per-flow
+        // verifier slot, flow index, legacy fixed verifier key) and the server
+        // storage adapter flushes each one immediately
+        expect(setAllCalls).toEqual(3);
 
-        // change cookie values to a fixed value so snapshots don't change due to randomness
+        // change cookie values and the random flow id in slot cookie names to
+        // fixed values so snapshots don't change due to randomness
         setCookies.forEach((obj) => {
           if (typeof obj.value === "string") {
             obj.value = "<RANDOM VALUE>";
           }
+          obj.name = obj.name.replace(
+            /-flow-[A-Za-z0-9_-]+-code-verifier$/,
+            "-flow-<FLOW ID>-code-verifier",
+          );
         });
 
         expect(setCookies).toMatchSnapshot();
@@ -616,6 +686,156 @@ describe("createServerClient", () => {
 
       // Constructor must not trigger any network activity
       expect(fetchCallCount).toBe(0);
+    });
+  });
+
+  describe("storage option", () => {
+    let warnings: any[][];
+    let warnSpy: any;
+
+    beforeEach(() => {
+      resetWarnOnceForTesting();
+      warnings = [];
+      warnSpy = vi
+        .spyOn(console, "warn")
+        .mockImplementation((...args: any[]) => {
+          warnings.push(args);
+        });
+    });
+
+    afterEach(() => {
+      warnSpy.mockRestore();
+    });
+
+    it("warns when `auth.storage` is passed, since it is always ignored", () => {
+      createServerClient("https://project-ref.supabase.co", "anon-key", {
+        cookies: {
+          getAll() {
+            return [];
+          },
+          setAll() {
+            // no-op
+          },
+        },
+        auth: { storage: {} as any },
+      });
+
+      expect(warnings.some((args) => /auth\.storage/.test(args[0]))).toBe(true);
+    });
+
+    it("warns only once across multiple calls", () => {
+      const options = {
+        cookies: {
+          getAll() {
+            return [];
+          },
+          setAll() {
+            // no-op
+          },
+        },
+        auth: { storage: {} as any },
+      };
+
+      createServerClient(
+        "https://project-ref.supabase.co",
+        "anon-key",
+        options,
+      );
+      createServerClient(
+        "https://project-ref.supabase.co",
+        "anon-key",
+        options,
+      );
+
+      expect(
+        warnings.filter((args) => /auth\.storage/.test(args[0])).length,
+      ).toBe(1);
+    });
+
+    it("does not warn when `auth.storage` is not passed", () => {
+      createServerClient("https://project-ref.supabase.co", "anon-key", {
+        cookies: {
+          getAll() {
+            return [];
+          },
+          setAll() {
+            // no-op
+          },
+        },
+      });
+
+      expect(warnings.some((args) => /auth\.storage/.test(args[0]))).toBe(
+        false,
+      );
+    });
+
+    it("still uses the cookie-backed storage even when `auth.storage` is passed", async () => {
+      const customStorageCalls: string[] = [];
+
+      const supabase = createServerClient(
+        "https://project-ref.supabase.co",
+        "anon-key",
+        {
+          cookies: {
+            getAll() {
+              return [
+                {
+                  name: "sb-project-ref-auth-token",
+                  value:
+                    "base64-" +
+                    stringToBase64URL(
+                      JSON.stringify({
+                        token_type: "bearer",
+                        access_token: "<valid-access-token>",
+                        refresh_token: "<valid-refresh-token>",
+                        expires_at: Math.floor(Date.now() / 1000) + 5 * 60, // expires in 5 mins
+                        expires_in: 5 * 60,
+                        user: {
+                          id: "<valid-user-id>",
+                        },
+                      }),
+                    ),
+                },
+              ];
+            },
+
+            setAll() {
+              // no-op
+            },
+          },
+
+          auth: {
+            storage: {
+              getItem: async (key: string) => {
+                customStorageCalls.push(key);
+                return null;
+              },
+              setItem: async (key: string) => {
+                customStorageCalls.push(key);
+              },
+              removeItem: async (key: string) => {
+                customStorageCalls.push(key);
+              },
+            },
+          },
+
+          global: {
+            fetch: async () => {
+              throw new Error("Should not be called");
+            },
+          },
+        },
+      );
+
+      const {
+        data: { session },
+        error,
+      } = await supabase.auth.getSession();
+
+      expect(error).toBeNull();
+      expect(session).not.toBeNull();
+      expect(session!.user.id).toEqual("<valid-user-id>");
+      expect(customStorageCalls).toEqual([]);
     });
   });
 });

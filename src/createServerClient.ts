@@ -5,14 +5,15 @@ import {
   SupabaseClientOptions,
 } from "@supabase/supabase-js";
 
-import { VERSION } from "./version";
-import { createStorageFromOptions, applyServerStorage } from "./cookies";
+import { applyServerStorage, createStorageFromOptions } from "./cookies";
 import type {
-  CookieOptionsWithName,
   CookieMethodsServer,
   CookieMethodsServerDeprecated,
+  CookieOptionsWithName,
 } from "./types";
 import { memoryLocalStorageAdapter } from "./utils/helpers";
+import { VERSION } from "./version";
+import { warnOnce } from "./warnOnce";
 import { warnIfUsingDeprecatedAuthHelpersPackage } from "./warnDeprecatedPackage";
 
 /**
@@ -79,13 +80,23 @@ export function createServerClient<
  * **Session initialization.**
  *
  * This client uses lazy session initialization (`skipAutoInitialize: true`).
- * The session is not loaded until the first call to `getSession()` or
- * `getUser()`. Token refreshes write the updated session back to cookies via
- * the `setAll` handler.
+ * The session is not loaded until the first call to `getSession()`,
+ * `getUser()`, or `getClaims()` (which calls `getSession()` internally when
+ * no explicit JWT is passed). Token refreshes write the updated session back
+ * to cookies via the `setAll` handler.
+ *
+ * **The `auth.storage` option is ignored.** The session is always persisted via
+ * cookies. Passing `options.auth.storage` has no effect — a one-time console
+ * warning is logged if you do. (`options.auth.userStorage` is still respected when `cookies.encode` is `"tokens-only"`.)
+ * If you want to source the session from somewhere other than the request cookies,
+ * use `@supabase/supabase-js`'s `createClient` directly with your own `storage`
+ * instead; `@supabase/ssr` isn't needed in that case.
  *
  * @param supabaseUrl The URL of the Supabase project.
  * @param supabaseKey The `anon` API key of the Supabase project.
  * @param options Various configuration options.
+ *
+ * @category Clients
  */
 export function createServerClient<
   Database = any,
@@ -123,6 +134,12 @@ export function createServerClient<
   if (!supabaseUrl || !supabaseKey) {
     throw new Error(
       `Your project's URL and Key are required to create a Supabase client!\n\nCheck your Supabase project's API settings to find these values\n\nhttps://supabase.com/dashboard/project/_/settings/api`,
+    );
+  }
+
+  if (options?.auth?.storage) {
+    warnOnce(
+      "@supabase/ssr: createServerClient always manages the session via cookies, so the `auth.storage` option you passed is ignored. If you want to source the session from somewhere other than the request cookies, use @supabase/supabase-js's createClient directly with your own `storage` instead.",
     );
   }
 
